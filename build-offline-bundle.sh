@@ -1,107 +1,86 @@
 #!/bin/bash
-#
-# build-offline-bundle.sh
-# Cria um bundle offline para RHEL 7 com OpenSCAP, Puppet e Ansible
-# Corre numa máquina RHEL 7 COM internet. Usa repotrack para garantir que
-# TODAS as dependências são descarregadas, mesmo as que já estão instaladas.
-#
-# Uso:  sudo ./build-offline-bundle.sh
-#
-set -euo pipefail
+set -e
 
-BUNDLE_DIR="${BUNDLE_DIR:-/var/tmp/offline-bundle}"
-ARCH="x86_64"
-DATE_TAG="$(date +%Y%m%d)"
-TARBALL="/var/tmp/rhel7-offline-bundle-${DATE_TAG}.tar.gz"
+BASE_DIR="/tmp/offline_bundle_rhel7"
+REPO_DIR="$BASE_DIR/repo"
 
-echo "==> A preparar diretórios em $BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR"/{openscap,ansible,puppet,repo-bootstrap}
+echo "[+] Criar diretórios..."
+mkdir -p "$REPO_DIR"
 
-echo "==> A instalar ferramentas (yum-utils, createrepo, wget)"
-yum install -y yum-utils createrepo wget
+echo "[+] Instalar ferramentas necessárias..."
+yum install -y yum-utils createrepo
 
-# ----------------------------------------------------------------------
-# 1. Garantir que os repos necessários estão configurados
-# ----------------------------------------------------------------------
-
-# Repo de extras da RHEL (onde mora o ansible)
-echo "==> A activar rhel-7-server-extras-rpms (se aplicável)"
-subscription-manager repos --enable=rhel-7-server-extras-rpms 2>/dev/null || \
-    echo "    (subscription-manager não disponível ou não-RHEL — ignorar)"
-
-# EPEL — opcional, mas algumas dependências do ansible podem vir daqui
-if ! rpm -q epel-release >/dev/null 2>&1; then
-    echo "==> A instalar epel-release"
-    yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm || true
+# EPEL (necessário para ansible)
+if ! rpm -q epel-release &>/dev/null; then
+  echo "[+] Instalar EPEL..."
+  yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
 fi
 
-# Repo do Puppet 7 (última versão com suporte a EL7)
-if ! rpm -q puppet7-release >/dev/null 2>&1; then
-    echo "==> A instalar puppet7-release"
-    rpm -Uvh https://yum.puppet.com/puppet7-release-el-7.noarch.rpm
+# Puppet repo (necessário para puppet-agent)
+if ! rpm -q puppet7-release &>/dev/null; then
+  echo "[+] Instalar repo Puppet..."
+  rpm -Uvh https://yum.puppet.com/puppet7-release-el-7.noarch.rpm
 fi
 
+echo "[+] Limpar cache yum..."
 yum clean all
 yum makecache
 
-# ----------------------------------------------------------------------
-# 2. Descarregar pacotes + TODAS as dependências
-#    (repotrack baixa tudo recursivamente, ao contrário do
-#     yumdownloader --resolve que ignora deps já instaladas)
-# ----------------------------------------------------------------------
+echo "[+] Download de pacotes e dependências (com repotrack)..."
+PACKAGES=(
+  openscap-scanner
+  scap-security-guide
+  ansible
+  puppet-agent
+)
 
-echo "==> A descarregar OpenSCAP + dependências"
-repotrack -a "$ARCH" -p "$BUNDLE_DIR/openscap" \
-    openscap \
-    openscap-scanner \
-    openscap-utils \
-    scap-security-guide
-
-echo "==> A descarregar Ansible + dependências"
-repotrack -a "$ARCH" -p "$BUNDLE_DIR/ansible" ansible
-
-echo "==> A descarregar Puppet agent + dependências"
-repotrack -a "$ARCH" -p "$BUNDLE_DIR/puppet" puppet-agent
-
-# ----------------------------------------------------------------------
-# 3. Guardar RPMs de bootstrap (releases de repos) — úteis na máquina
-#    destino se quiseres mais tarde apontar à internet
-# ----------------------------------------------------------------------
-echo "==> A guardar pacotes de bootstrap dos repos"
-wget -q -P "$BUNDLE_DIR/repo-bootstrap/" \
-    https://yum.puppet.com/puppet7-release-el-7.noarch.rpm
-wget -q -P "$BUNDLE_DIR/repo-bootstrap/" \
-    https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm || true
-
-# ----------------------------------------------------------------------
-# 4. Criar metadata de repositório local em cada pasta
-# ----------------------------------------------------------------------
-for d in openscap ansible puppet; do
-    echo "==> A criar metadata em $BUNDLE_DIR/$d"
-    createrepo "$BUNDLE_DIR/$d"
+for pkg in "${PACKAGES[@]}"; do
+  echo "  -> $pkg"
+  repotrack -a x86_64 -p "$REPO_DIR" "$pkg"
 done
 
-# ----------------------------------------------------------------------
-# 5. Incluir o script de instalação dentro do bundle
-# ----------------------------------------------------------------------
-cp -f "$(dirname "$0")/install-offline-bundle.sh" "$BUNDLE_DIR/" 2>/dev/null || true
+echo "[+] Criar repositório local..."
+createrepo "$REPO_DIR"
 
-# ----------------------------------------------------------------------
-# 6. Empacotar tudo num tarball
-# ----------------------------------------------------------------------
-echo "==> A empacotar em $TARBALL"
-tar -czf "$TARBALL" -C "$(dirname "$BUNDLE_DIR")" "$(basename "$BUNDLE_DIR")"
+echo "[+] Criar script de instalação offline..."
+cat << 'EOF' > "$BASE_DIR/install_offline.sh"
+#!/bin/bash
+set -e
 
-echo
-echo "==================================================================="
-echo "Bundle criado: $TARBALL"
-ls -lh "$TARBALL"
-echo
-echo "Conteúdo:"
-du -sh "$BUNDLE_DIR"/*
-echo "==================================================================="
-echo
-echo "Próximos passos:"
-echo "  1. Copia $TARBALL para a máquina offline"
-echo "  2. Extrai:  tar -xzf $(basename "$TARBALL") -C /var/tmp/"
-echo "  3. Corre:   sudo /var/tmp/offline-bundle/install-offline-bundle.sh"
+REPO_SRC="$(dirname "$0")/repo"
+REPO_DST="/opt/offline_repo"
+
+echo "[+] Copiar repo para $REPO_DST..."
+mkdir -p "$REPO_DST"
+cp -r "$REPO_SRC"/. "$REPO_DST/"
+
+echo "[+] Criar ficheiro repo local..."
+cat << EOL > /etc/yum.repos.d/offline.repo
+[offline-repo]
+name=Offline Repo
+baseurl=file://${REPO_DST}
+enabled=1
+gpgcheck=0
+priority=1
+EOL
+
+# Desativar outros repos para evitar conflitos
+echo "[+] Desativar repos externos..."
+yum-config-manager --disable \* 2>/dev/null || true
+yum-config-manager --enable offline-repo
+
+echo "[+] Limpar cache yum..."
+yum clean all
+
+echo "[+] Instalar pacotes..."
+yum install -y openscap-scanner scap-security-guide ansible puppet-agent
+
+echo "[+] Instalação concluída com sucesso!"
+EOF
+chmod +x "$BASE_DIR/install_offline.sh"
+
+echo "[+] Compactar bundle..."
+tar -czf /tmp/offline_bundle_rhel7.tar.gz -C /tmp offline_bundle_rhel7/
+
+echo "[+] Bundle criado: /tmp/offline_bundle_rhel7.tar.gz"
+echo "[+] Próximo passo: transferir para a máquina offline e executar install_offline.sh como root"
